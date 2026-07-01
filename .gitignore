@@ -1,0 +1,108 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual Environments
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# PyTorch / Model Checkpoints
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+*.onnx
+checkpoints/
+ckpt/
+models/
+weights/
+*.state_dict
+
+# Training Logs & Runs
+logs/
+runs/
+outputs/
+experiments/
+wandb/
+mlruns/
+tensorboard/
+*.log
+
+# Data (大型数据集不提交)
+*.parquet
+*.arrow
+*.lmdb
+data/raw/
+data/processed/
+cache/
+.huggingface/
+.hf_cache/
+
+# Jupyter
+.ipynb_checkpoints
+*.ipynb
+
+# Environment Variables
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+*.cert
+
+# Docker
+*.pid
+*.sock
+
+# CANN / Ascend NPU
+npu-*.log
+ascend_log/
+profiling_data/
+
+# Distribution / packaging
+*.tar.gz
+*.whl
+*.egg-info/
+
+# Coverage
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+
+# mypy
+.mypy_cache/
+.dmypy.json
+
+# Pytest
+.pytest_cache/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.bak
+*.swp

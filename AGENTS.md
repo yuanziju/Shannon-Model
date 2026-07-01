@@ -15,22 +15,26 @@
 ### 文件结构
 
 ```
-Shannon/
-├── README.md                 ← 项目总览 (v4.0, 人类可读)
+multimodal-ai-project/
+├── readme.md                 ← 项目总览 (v4.0, 人类可读)
 ├── spec.md                   ← 技术规格书 (v4.0, 应该做什么)
-├── inference_engine.md       ← 推理引擎架构 (怎么推理)
-├── training_engine.md        ← 训练引擎架构 (怎么训练)
-├── datasets.md               ← 数据策略 (用什么数据)
-├── AGENTS.md                 ← 本文件 (谁来做+项目结构)
+├── inference_engine.md       ← 推理引擎架构 (2007行, 怎么推理)
+├── training_engine.md        ← 训练引擎架构 (1890行, 怎么训练)
+├── task.md                   ← 任务分解 (我要干些什么)
+├── checklist.md              ← 验收清单 (有没有做错/做漏)
+├── agents.md                 ← 本文件 (谁来做+项目结构)
 ├── future.md                 ← 未来规划 (以后做什么)
-├── 03b_latent_decoding_implementation.md ← 隐空间解码实现 (1254行)
-├── 05b_ctm_implementation.md ← CTM实现方案 (1619行)
-└── .trae/
-    └── specs/
-        └── shannon-ai-model/
-            ├── spec.md       ← Spec版本技术规格书
-            ├── task.md       ← 任务分解 (我要干些什么)
-            └── checklist.md  ← 验收清单 (有没有做错/做漏)
+├── datasets.md               ← 数据策略 (用什么数据)
+├── all-in-one.md             ← 终极融合文档 (全部汇总, 喂给AI)
+├── prompt.md                 ← 融合提示词
+└── brainstorming/
+    ├── 01_parallel_inference.md       ← 并行推理设计
+    ├── 02_dynamic_weight_generation.md ← 动态权重生成
+    ├── 03_latent_space_decoding.md    ← 隐空间解码 (15项决策)
+    ├── 03b_latent_decoding_implementation.md ← 隐空间解码实现 (1254行)
+    ├── 04_intuition.md                ← 直觉能力设计
+    ├── 05_ctm_reference.md            ← CTM参考设计 (17项决策)
+    └── 05b_ctm_implementation.md      ← CTM实现方案 (1619行)
 ```
 
 ### 技术栈层次
