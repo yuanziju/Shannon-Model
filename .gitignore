@@ -37,7 +37,9 @@ desktop.ini
 *.onnx
 checkpoints/
 ckpt/
-models/
+models/*/checkpoints/
+models/*/ckpt/
+models/*/weights/
 weights/
 *.state_dict
 
