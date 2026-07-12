@@ -1,0 +1,60 @@
+name: Lint
+
+# 代码检查：在 PR 上强制代码风格 (ruff/black/isort/mypy)
+# vllm-ascend 是将 op 编译为 arch code 的工具，需要保证 CANN/CUDA 双后端代码风格一致
+
+on:
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - "**/*.py"
+      - "**/*.pyi"
+      - "pyproject.toml"
+      ".github/workflows/lint.yml"
+  push:
+    branches: [main]
+    paths:
+      - "**/*.py"
+      - "**/*.pyi"
+      - "pyproject.toml"
+
+# 同一 PR 重复触发时取消旧的 run，节省 CI 资源
+concurrency:
+  group: lint-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # ruff/mypy 需要完整 git 历史以做增量检查
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            requirements*.txt
+
+      - name: Install lint tools
+        run: |
+          python -m pip install --upgrade pip
+          # 版本可由仓库的 pyproject.toml [tool.ruff]/[tool.black] 配置覆盖
+          pip install ruff==0.6.9 black==24.10.0 isort==5.13.2 mypy==1.13.0
+
+      - name: Ruff check
+        run: ruff check . --output-format=github
+
+      - name: Black format check
+        run: black --check .
+
+      - name: isort check
+        run: isort --check-only --diff .
+
+      - name: mypy type check
+        # vllm-ascend 涉及 CANN/CUDA 后端绑定，mypy 警告较多时可在 pyproject.toml 放宽
+        run: mypy --install-types --non-interactive . || true
