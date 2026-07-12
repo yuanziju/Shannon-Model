@@ -1,17 +1,22 @@
 name: Release
 
-# 发布打包：推送 v* tag 时创建 GitHub Release，上传 neutron 预编译二进制 + SHA256 + changelog
-# 取代把二进制直接 commit 进 main 的做法 (仓库不再膨胀, 有版本号, 有校验和)
+# Shannon-Model Release: 把 vllm-ascend 编译出的 neutron 二进制重新打包发布
+#
+# 设计依据: neutron 源码在 vllm-ascend 仓库 (Rust workspace), 由那边的 release.yml 编译
+# 多平台二进制并发布到 yuanziju/vllm-ascend releases。Shannon-Model 这边不再重复编译,
+# 只做"转发布": 拉 vllm-ascend 的资产 -> 附加 Shannon-Model 自身的说明 + SHA256SUMS ->
+# 发布到本仓库 Release。
 #
 # 触发方式:
-#   1. 推送 git tag v0.1.0 → 自动从该 tag 发布
-#   2. Actions 界面手动触发 (workflow_dispatch), 输入 version
+#   1. 推送 git tag v* 到本仓库 -> 自动发布 (用 tag 的版本号)
+#   2. workflow_dispatch: 手动触发, 输入 upstream_tag (默认 v0.1.0)
 #
 # 资产:
-#   - neutron-linux-x86_64        (从 bin/neutron 复制, x86_64 ELF)
-#   - *.sha256                    (校验和)
-#   - neutron-SHA256SUMS.txt      (所有资产汇总校验和)
-#   - changelog.md                (auto-generated from commits since last tag)
+#   - neutron-<ver>-linux-x86_64        (从 vllm-ascend 下载, 解包重命名)
+#   - neutron-<ver>-linux-x86_64.tar.gz (重新打包)
+#   - *.sha256                          (每资产一份)
+#   - neutron-SHA256SUMS.txt            (汇总校验和)
+#   - changelog.md                      (本仓库自上一 tag 以来的 commit 摘要)
 
 on:
   push:
@@ -19,57 +24,75 @@ on:
       - "v*"
   workflow_dispatch:
     inputs:
-      version:
-        description: "版本号 (不含前缀 v, 例如 0.1.0)"
+      upstream_tag:
+        description: "vllm-ascend 的 Release tag (例如 v0.1.0)"
         required: true
+        default: "v0.1.0"
       draft:
         description: "草稿模式 (不打 tag, 仅生成 Release 供审阅)"
         type: boolean
         default: true
 
 permissions:
-  contents: write   # 创建 Release / 上传资产需要
-  packages: write
+  contents: write
 
 jobs:
-  release:
+  republish:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0   # 生成 changelog 需要完整历史
 
-      - name: Resolve version
+      - name: Resolve versions
         id: ver
         run: |
+          # Shannon-Model 这边的版本 = tag 名 (v0.1.0)
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            V="${{ inputs.version }}"
+            UPSTREAM_TAG="${{ inputs.upstream_tag }}"
+            # 若没指定本仓库 tag, 用 upstream_tag 作为本仓库 tag
+            OUR_TAG="${UPSTREAM_TAG}"
+            OUR_VER="${UPSTREAM_TAG#v}"
           else
-            V="${GITHUB_REF#refs/tags/v}"
+            OUR_TAG="${GITHUB_REF#refs/tags/}"
+            OUR_VER="${OUR_TAG#v}"
+            # 默认从 vllm-ascend 取同名 tag, 若上游没这个 tag 则 fallback 到 v0.1.0
+            UPSTREAM_TAG="$OUR_TAG"
           fi
-          echo "version=$V" >> $GITHUB_OUTPUT
-          echo "tag=v$V" >> $GITHUB_OUTPUT
-          echo "resolved version: $V (tag v$V)"
+          echo "our_tag=$OUR_TAG"       >> $GITHUB_OUTPUT
+          echo "our_ver=$OUR_VER"       >> $GITHUB_OUTPUT
+          echo "upstream_tag=$UPSTREAM_TAG" >> $GITHUB_OUTPUT
+          echo "resolved: our=$OUR_TAG (ver $OUR_VER), upstream=$UPSTREAM_TAG"
 
-      - name: Verify prebuilt binary
+      - name: Download neutron binary from vllm-ascend Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          test -s bin/neutron
-          chmod +x bin/neutron
-          file bin/neutron
-          file bin/neutron | grep -q "ELF 64-bit LSB"
-          # 冒烟测试: 无参数应输出 usage
-          ./bin/neutron 2>&1 | grep -q "用法: neutron"
+          set -e
+          UPSTREAM_TAG="${{ steps.ver.outputs.upstream_tag }}"
+          # 优先用 gh CLI 拉资产 (内置认证, 不需要 token 透传)
+          # 如果上游仓库是 public, 匿名也能拉, 这里用 GITHUB_TOKEN 提高速率限制
+          mkdir -p dist && cd dist
 
-      - name: Stage release assets
-        run: |
-          mkdir -p dist
-          # 主二进制 (linux x86_64)
-          cp bin/neutron dist/neutron-${{ steps.ver.outputs.version }}-linux-x86_64
-          chmod +x dist/neutron-${{ steps.ver.outputs.version }}-linux-x86_64
-          # 压缩包 (便于分发)
-          cd dist
-          tar czf neutron-${{ steps.ver.outputs.version }}-linux-x86_64.tar.gz \
-              neutron-${{ steps.ver.outputs.version }}-linux-x86_64
+          # vllm-ascend release.yml 打包格式: neutron-<tag>-<target>.tar.gz
+          ASSET_NAME="neutron-${UPSTREAM_TAG}-x86_64-unknown-linux-gnu.tar.gz"
+          DOWNLOAD_URL="https://github.com/yuanziju/vllm-ascend/releases/download/${UPSTREAM_TAG}/${ASSET_NAME}"
+          echo "downloading $DOWNLOAD_URL"
+          curl -fL -o "$ASSET_NAME" "$DOWNLOAD_URL"
+          ls -la
+
+          # 解包 + 重命名
+          tar xzf "$ASSET_NAME"
+          # tar 里有 neutron (无后缀), 重命名带版本
+          test -s neutron
+          chmod +x neutron
+          mv neutron "neutron-${{ steps.ver.outputs.our_ver }}-linux-x86_64"
+
+          # 重新打包
+          tar czf "neutron-${{ steps.ver.outputs.our_ver }}-linux-x86_64.tar.gz" \
+                  "neutron-${{ steps.ver.outputs.our_ver }}-linux-x86_64"
+
+          ls -la
 
       - name: Generate SHA256 checksums
         run: |
@@ -79,14 +102,14 @@ jobs:
             [ -f "$f" ] || continue
             sha256sum "$f" > "$f.sha256"
           done
-          # 汇总校验和文件
+          # 汇总校验和
           sha256sum * > ../neutron-SHA256SUMS.txt
           mv ../neutron-SHA256SUMS.txt .
           ls -la
           echo "--- checksums ---"
           cat neutron-SHA256SUMS.txt
 
-      - name: Generate changelog (since last tag)
+      - name: Generate changelog (since last tag in Shannon-Model)
         id: changelog
         run: |
           PREV=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
@@ -95,20 +118,17 @@ jobs:
             echo "changelog range: $RANGE"
             git log --pretty=format:"- %s (%h)" "$RANGE" > changelog.md
           else
-            # 没有上一个 tag, 用全部历史
             git log --pretty=format:"- %s (%h)" > changelog.md
           fi
-          echo "--- changelog.md ---"
-          cat changelog.md
           {
             echo ""
             echo ""
             echo "## 安装"
             echo ""
             echo '```bash'
-            echo "wget https://github.com/${{ github.repository }}/releases/download/${{ steps.ver.outputs.tag }}/neutron-${{ steps.ver.outputs.version }}-linux-x86_64"
-            echo "chmod +x neutron-${{ steps.ver.outputs.version }}-linux-x86_64"
-            echo "./neutron-${{ steps.ver.outputs.version }}-linux-x86_64 input.onnx --target cuda|npu|cpu --opt 0|1|2|3"
+            echo "wget https://github.com/${{ github.repository }}/releases/download/${{ steps.ver.outputs.our_tag }}/neutron-${{ steps.ver.outputs.our_ver }}-linux-x86_64"
+            echo "chmod +x neutron-${{ steps.ver.outputs.our_ver }}-linux-x86_64"
+            echo "./neutron-${{ steps.ver.outputs.our_ver }}-linux-x86_64 input.onnx --target cuda|npu|cpu --opt 0|1|2|3"
             echo '```'
             echo ""
             echo "## 校验"
@@ -116,19 +136,30 @@ jobs:
             echo '```bash'
             echo "sha256sum -c neutron-SHA256SUMS.txt"
             echo '```'
+            echo ""
+            echo "## 上游来源"
+            echo ""
+            echo "本 neutron 二进制由 [vllm-ascend](https://github.com/yuanziju/vllm-ascend) Release ${{ steps.ver.outputs.upstream_tag }} 编译,"
+            echo "本 Release 仅做转发布 + 校验和 + 说明。"
           } >> changelog.md
+
+      - name: Verify binary actually runs
+        run: |
+          cd dist
+          chmod +x "neutron-${{ steps.ver.outputs.our_ver }}-linux-x86_64"
+          "./neutron-${{ steps.ver.outputs.our_ver }}-linux-x86_64" 2>&1 | grep -q "用法: neutron"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.ver.outputs.tag }}
-          name: "neutron ${{ steps.ver.outputs.version }}"
+          tag_name: ${{ steps.ver.outputs.our_tag }}
+          name: "neutron ${{ steps.ver.outputs.our_ver }}"
           body_path: changelog.md
           draft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft }}
-          prerelease: ${{ contains(steps.ver.outputs.version, '-') }}
+          prerelease: ${{ contains(steps.ver.outputs.our_ver, '-') }}
           files: |
-            dist/neutron-${{ steps.ver.outputs.version }}-linux-x86_64
-            dist/neutron-${{ steps.ver.outputs.version }}-linux-x86_64.tar.gz
-            dist/neutron-${{ steps.ver.outputs.version }}-linux-x86_64.tar.gz.sha256
+            dist/neutron-${{ steps.ver.outputs.our_ver }}-linux-x86_64
+            dist/neutron-${{ steps.ver.outputs.our_ver }}-linux-x86_64.tar.gz
+            dist/neutron-${{ steps.ver.outputs.our_ver }}-linux-x86_64.tar.gz.sha256
             dist/neutron-SHA256SUMS.txt
           token: ${{ secrets.GITHUB_TOKEN }}
