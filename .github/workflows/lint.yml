@@ -1,11 +1,11 @@
 name: Lint
 
 # 代码检查：在 PR 上强制代码风格 (ruff/black/isort/mypy)
-# vllm-ascend 是将 op 编译为 arch code 的工具，需要保证 CANN/CUDA 双后端代码风格一致
+# Shannon-Model 是 Python AI 模型项目, neutron 二进制由 vllm-ascend 仓库构建
 
 on:
   pull_request:
-    branches: [main, dev]
+    branches: [main]
     paths:
       - "**/*.py"
       - "**/*.pyi"
@@ -56,5 +56,5 @@ jobs:
         run: isort --check-only --diff .
 
       - name: mypy type check
-        # vllm-ascend 涉及 CANN/CUDA 后端绑定，mypy 警告较多时可在 pyproject.toml 放宽
+        # Shannon-Model 涉及多模态/CANN/CUDA 后端绑定，mypy 警告较多时可在 pyproject.toml 放宽
         run: mypy --install-types --non-interactive . || true

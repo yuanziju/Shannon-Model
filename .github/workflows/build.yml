@@ -1,20 +1,21 @@
 name: Build
 
-# 构建检查：从源码编译 neutron 二进制 + 验证预编译 bin/neutron 可运行
-# vllm-ascend: 把 ONNX op 编译成 arch code, 支持 CANN(NPU) / CUDA / CPU 三后端
+# 构建检查：验证 bin/neutron 预编译二进制可运行 + SHA256 校验
+# neutron 源码在 vllm-ascend 仓库 (Rust workspace), 不在此仓库构建
+# 此处只做"下载产物冒烟"——确保 commit 进 main 的二进制可用
 
 on:
   pull_request:
-    branches: [main, dev]
+    branches: [main]
     paths:
-      - "src/**"            # neutron 源码 (Rust)
-      - "bin/neutron"       # 预编译产物
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "pyproject.toml"
-      ".github/workflows/build.yml"
+      - "bin/neutron"
+      - "bin/neutron.sha256"
+      - ".github/workflows/build.yml"
   push:
     branches: [main]
+    paths:
+      - "bin/neutron"
+      - "bin/neutron.sha256"
   workflow_dispatch:
 
 concurrency:
@@ -22,7 +23,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # -------- 1. 预编译二进制冒烟测试 --------
   smoke-test-binary:
     runs-on: ubuntu-latest
     steps:
@@ -33,93 +33,67 @@ jobs:
 
       - name: Verify ELF format
         run: |
+          test -s bin/neutron
           file bin/neutron
           # 必须 x86_64 ELF, 不能是空文件或文本
-          test -s bin/neutron
           file bin/neutron | grep -q "ELF 64-bit LSB"
+
+      - name: Verify SHA256 checksum
+        # 如果存在 bin/neutron.sha256 则校验, 不存在则跳过 (老 commit 可能没有)
+        run: |
+          if [ -f bin/neutron.sha256 ]; then
+            echo "found bin/neutron.sha256, verifying..."
+            cat bin/neutron.sha256
+            # sha256sum -c 需要 .sha256 文件内容格式为 "<hash>  <filename>"
+            # 兼容 ta 写的格式 (可能是 "<hash>  bin/neutron" 或裸 hash)
+            if grep -q "bin/neutron" bin/neutron.sha256; then
+              (cd bin && sha256sum -c neutron.sha256)
+            else
+              # 裸 hash 格式
+              expected=$(awk '{print $1}' bin/neutron.sha256 | tr -d '[:space:]')
+              actual=$(sha256sum bin/neutron | awk '{print $1}')
+              echo "expected: $expected"
+              echo "actual:   $actual"
+              test "$expected" = "$actual"
+            fi
+            echo "SHA256 OK"
+          else
+            echo "::notice::bin/neutron.sha256 not found, skipping checksum verification"
+          fi
 
       - name: Run with no args (expect usage)
         run: |
           out=$(./bin/neutron 2>&1 || true)
           echo "$out"
+          # neutron 无参数应输出 usage
           echo "$out" | grep -q "用法: neutron"
-          echo "$out" | grep -q "cuda|npu|cpu"
+          # 且必须列出所有 target
+          echo "$out" | grep -q "cuda"
+          echo "$out" | grep -q "npu"
+          echo "$out" | grep -q "cpu"
 
-      - name: Upload artifact
+      - name: Smoke compile a tiny ONNX (cpu target)
+        # 真正喂一个最小 ONNX, 验证编译流程能跑通
+        run: |
+          pip install --quiet onnxruntime numpy
+          python - <<'PY'
+          import numpy as np, onnx
+          from onnx import helper, TensorProto
+          X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 3])
+          Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 3])
+          node = helper.make_node("Relu", ["X"], ["Y"])
+          g = helper.make_graph([node], "g", [X], [Y])
+          m = helper.make_model(g, opset_imports=[helper.make_opsetid("", 17)])
+          onnx.save(m, "relu.onnx")
+          PY
+          ./bin/neutron relu.onnx --target cpu --opt 1 --dump 2>&1 | tee compile.log
+          test -s compile.log
+
+      - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
           name: neutron-binary
-          path: bin/neutron
-
-  # -------- 2. 从源码构建 (Rust) --------
-  build-from-source:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-        rust: [stable]
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            artifact: neutron-linux-x86_64
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            artifact: neutron-macos-arm64
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Check Rust source exists
-        id: has-rust
-        run: |
-          if [ -f Cargo.toml ] && [ -d src ]; then
-            echo "has_rust=true" >> $GITHUB_OUTPUT
-            echo "found Cargo.toml + src/"
-          else
-            echo "has_rust=false" >> $GITHUB_OUTPUT
-            echo "no Rust source, skip build-from-source"
-          fi
-
-      - name: Setup Rust toolchain
-        if: steps.has-rust.outputs.has-rust == 'true'
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Cargo cache
-        if: steps.has-rust.outputs.has_rust == 'true'
-        uses: actions/cache@v4
-        with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-${{ matrix.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ matrix.os }}-
-
-      - name: Build release
-        if: steps.has-rust.outputs.has_rust == 'true'
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Verify built binary runs
-        if: steps.has-rust.outputs.has_rust == 'true'
-        run: |
-          BIN=target/${{ matrix.target }}/release/neutron
-          chmod +x "$BIN"
-          out=$("$BIN" 2>&1 || true)
-          echo "$out" | grep -q "用法: neutron"
-
-      - name: Package binary
-        if: steps.has-rust.outputs.has_rust == 'true'
-        run: |
-          mkdir -p dist
-          cp target/${{ matrix.target }}/release/neutron dist/${{ matrix.artifact }}
-          cd dist && tar czf ${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}
-          sha256sum ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
-
-      - name: Upload build artifact
-        if: steps.has-rust.outputs.has_rust == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: dist/
+            bin/neutron
+            bin/neutron.sha256
+            compile.log
