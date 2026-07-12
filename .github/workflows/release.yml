@@ -1,0 +1,134 @@
+name: Release
+
+# 发布打包：推送 v* tag 时创建 GitHub Release，上传 neutron 预编译二进制 + SHA256 + changelog
+# 取代把二进制直接 commit 进 main 的做法 (仓库不再膨胀, 有版本号, 有校验和)
+#
+# 触发方式:
+#   1. 推送 git tag v0.1.0 → 自动从该 tag 发布
+#   2. Actions 界面手动触发 (workflow_dispatch), 输入 version
+#
+# 资产:
+#   - neutron-linux-x86_64        (从 bin/neutron 复制, x86_64 ELF)
+#   - *.sha256                    (校验和)
+#   - neutron-SHA256SUMS.txt      (所有资产汇总校验和)
+#   - changelog.md                (auto-generated from commits since last tag)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号 (不含前缀 v, 例如 0.1.0)"
+        required: true
+      draft:
+        description: "草稿模式 (不打 tag, 仅生成 Release 供审阅)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write   # 创建 Release / 上传资产需要
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # 生成 changelog 需要完整历史
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            V="${{ inputs.version }}"
+          else
+            V="${GITHUB_REF#refs/tags/v}"
+          fi
+          echo "version=$V" >> $GITHUB_OUTPUT
+          echo "tag=v$V" >> $GITHUB_OUTPUT
+          echo "resolved version: $V (tag v$V)"
+
+      - name: Verify prebuilt binary
+        run: |
+          test -s bin/neutron
+          chmod +x bin/neutron
+          file bin/neutron
+          file bin/neutron | grep -q "ELF 64-bit LSB"
+          # 冒烟测试: 无参数应输出 usage
+          ./bin/neutron 2>&1 | grep -q "用法: neutron"
+
+      - name: Stage release assets
+        run: |
+          mkdir -p dist
+          # 主二进制 (linux x86_64)
+          cp bin/neutron dist/neutron-${{ steps.ver.outputs.version }}-linux-x86_64
+          chmod +x dist/neutron-${{ steps.ver.outputs.version }}-linux-x86_64
+          # 压缩包 (便于分发)
+          cd dist
+          tar czf neutron-${{ steps.ver.outputs.version }}-linux-x86_64.tar.gz \
+              neutron-${{ steps.ver.outputs.version }}-linux-x86_64
+
+      - name: Generate SHA256 checksums
+        run: |
+          cd dist
+          # 每个资产一份 .sha256
+          for f in *; do
+            [ -f "$f" ] || continue
+            sha256sum "$f" > "$f.sha256"
+          done
+          # 汇总校验和文件
+          sha256sum * > ../neutron-SHA256SUMS.txt
+          mv ../neutron-SHA256SUMS.txt .
+          ls -la
+          echo "--- checksums ---"
+          cat neutron-SHA256SUMS.txt
+
+      - name: Generate changelog (since last tag)
+        id: changelog
+        run: |
+          PREV=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -n "$PREV" ]; then
+            RANGE="${PREV}..HEAD"
+            echo "changelog range: $RANGE"
+            git log --pretty=format:"- %s (%h)" "$RANGE" > changelog.md
+          else
+            # 没有上一个 tag, 用全部历史
+            git log --pretty=format:"- %s (%h)" > changelog.md
+          fi
+          echo "--- changelog.md ---"
+          cat changelog.md
+          {
+            echo ""
+            echo ""
+            echo "## 安装"
+            echo ""
+            echo '```bash'
+            echo "wget https://github.com/${{ github.repository }}/releases/download/${{ steps.ver.outputs.tag }}/neutron-${{ steps.ver.outputs.version }}-linux-x86_64"
+            echo "chmod +x neutron-${{ steps.ver.outputs.version }}-linux-x86_64"
+            echo "./neutron-${{ steps.ver.outputs.version }}-linux-x86_64 input.onnx --target cuda|npu|cpu --opt 0|1|2|3"
+            echo '```'
+            echo ""
+            echo "## 校验"
+            echo ""
+            echo '```bash'
+            echo "sha256sum -c neutron-SHA256SUMS.txt"
+            echo '```'
+          } >> changelog.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: "neutron ${{ steps.ver.outputs.version }}"
+          body_path: changelog.md
+          draft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft }}
+          prerelease: ${{ contains(steps.ver.outputs.version, '-') }}
+          files: |
+            dist/neutron-${{ steps.ver.outputs.version }}-linux-x86_64
+            dist/neutron-${{ steps.ver.outputs.version }}-linux-x86_64.tar.gz
+            dist/neutron-${{ steps.ver.outputs.version }}-linux-x86_64.tar.gz.sha256
+            dist/neutron-SHA256SUMS.txt
+          token: ${{ secrets.GITHUB_TOKEN }}
