@@ -47,7 +47,7 @@ jobs:
             # sha256sum -c 需要 .sha256 文件内容格式为 "<hash>  <filename>"
             # 兼容 ta 写的格式 (可能是 "<hash>  bin/neutron" 或裸 hash)
             if grep -q "bin/neutron" bin/neutron.sha256; then
-              (cd bin && sha256sum -c neutron.sha256)
+              sha256sum -c bin/neutron.sha256
             else
               # 裸 hash 格式
               expected=$(awk '{print $1}' bin/neutron.sha256 | tr -d '[:space:]')
