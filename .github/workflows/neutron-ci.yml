@@ -1,0 +1,82 @@
+name: Neutron Operator Compilation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "models/**/*.onnx"
+      - "operators/**/*.onnx"
+      - "bin/neutron"
+  pull_request:
+    branches: [main]
+    paths:
+      - "models/**/*.onnx"
+      - "operators/**/*.onnx"
+      - "bin/neutron"
+  workflow_dispatch:
+    inputs:
+      onnx_file:
+        description: "ONNX 文件路径（相对仓库根目录）"
+        required: false
+        default: ""
+      target:
+        description: "目标平台 (cuda/npu/cpu)"
+        required: false
+        default: "npu"
+      opt_level:
+        description: "优化等级 (0/1/2/3)"
+        required: false
+        default: "2"
+
+jobs:
+  compile:
+    name: Compile Operators
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify neutron binary
+        run: |
+          chmod +x bin/neutron
+          ./bin/neutron 2>&1 || true
+
+      - name: Find ONNX files
+        id: find
+        run: |
+          if [ -n "${{ github.event.inputs.onnx_file }}" ]; then
+            echo "files=${{ github.event.inputs.onnx_file }}" >> $GITHUB_OUTPUT
+          else
+            files=$(find . -name "*.onnx" -not -path "./.git/*" | head -20)
+            if [ -z "$files" ]; then
+              echo "::notice::No ONNX files found, skipping compilation"
+            fi
+            echo "files=$files" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Compile ONNX operators
+        if: steps.find.outputs.files != ''
+        env:
+          TARGET: ${{ github.event.inputs.target || 'npu' }}
+          OPT_LEVEL: ${{ github.event.inputs.opt_level || '2' }}
+        run: |
+          mkdir -p build/kernels
+          echo "$FILES" | while read -r f; do
+            [ -z "$f" ] && continue
+            name=$(basename "$f" .onnx)
+            echo "::group::Compiling $f → $TARGET"
+            ./bin/neutron "$f" --target "$TARGET" --opt "$OPT_LEVEL" --dump \
+              > "build/kernels/${name}_${TARGET}.txt" 2>&1 \
+              && echo "OK: $f" \
+              || echo "::error::Failed to compile $f"
+            echo "::endgroup::"
+          done
+        shell: bash
+
+      - name: Upload compiled kernels
+        if: steps.find.outputs.files != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiled-kernels
+          path: build/kernels/
+          retention-days: 30
