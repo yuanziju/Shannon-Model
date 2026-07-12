@@ -10,7 +10,7 @@ on:
       - "**/*.py"
       - "**/*.pyi"
       - "pyproject.toml"
-      ".github/workflows/lint.yml"
+      - ".github/workflows/lint.yml"
   push:
     branches: [main]
     paths:
