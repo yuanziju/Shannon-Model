@@ -75,7 +75,7 @@ jobs:
       - name: Smoke compile a tiny ONNX (cpu target)
         # 真正喂一个最小 ONNX, 验证编译流程能跑通
         run: |
-          pip install --quiet onnxruntime numpy
+          pip install --quiet onnx onnxruntime numpy
           python - <<'PY'
           import numpy as np, onnx
           from onnx import helper, TensorProto
