@@ -77,8 +77,8 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Install onnxruntime (fixture 生成)
-        run: pip install onnxruntime numpy
+      - name: Install onnx (fixture 生成)
+        run: pip install onnx onnxruntime numpy
 
       - name: Make binary executable
         run: chmod +x bin/neutron
