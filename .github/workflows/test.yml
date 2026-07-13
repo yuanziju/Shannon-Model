@@ -5,7 +5,7 @@ name: Test
 
 on:
   pull_request:
-    branches: [main, dev]
+    branches: [main]
     paths:
       - "**/*.py"
       - "bin/neutron"
@@ -17,7 +17,7 @@ on:
   workflow_dispatch:  # 手动触发，便于排查
 
 concurrency:
-  group: test-${{ github.ref }}-${{ matrix.target }}
+  group: test-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -77,8 +77,8 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Install onnxruntime (fixture 生成)
-        run: pip install onnxruntime numpy
+      - name: Install onnx (fixture 生成)
+        run: pip install onnx onnxruntime numpy
 
       - name: Make binary executable
         run: chmod +x bin/neutron

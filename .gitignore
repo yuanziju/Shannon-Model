@@ -74,6 +74,7 @@ cache/
 *.key
 *.pem
 *.cert
+.pat
 
 # Docker
 *.pid

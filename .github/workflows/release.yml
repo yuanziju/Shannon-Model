@@ -25,9 +25,9 @@ on:
   workflow_dispatch:
     inputs:
       upstream_tag:
-        description: "vllm-ascend 的 Release tag (例如 v0.1.0)"
+        description: "vllm-ascend 的 Release tag (例如 v0.1.1)"
         required: true
-        default: "v0.1.0"
+        default: "v0.1.1"
       draft:
         description: "草稿模式 (不打 tag, 仅生成 Release 供审阅)"
         type: boolean

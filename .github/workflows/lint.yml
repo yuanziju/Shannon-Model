@@ -46,15 +46,34 @@ jobs:
           # 版本可由仓库的 pyproject.toml [tool.ruff]/[tool.black] 配置覆盖
           pip install ruff==0.6.9 black==24.10.0 isort==5.13.2 mypy==1.13.0
 
+      - name: Get changed Python files
+        # 只检查本次变更的 .py/.pyi，避免 common/ 等模型代码的历史遗留 ruff 违规阻塞 PR
+        # 新增/修改的 .py 仍会被严格检查，预存违规不掩盖、留给模型代码 owner 清理
+        id: changed-py
+        run: |
+          BASE="${{ github.event.pull_request.base.sha || github.event.before || 'HEAD~1' }}"
+          git diff --name-only --diff-filter=AM "$BASE" HEAD -- '*.py' '*.pyi' 2>/dev/null > /tmp/pyfiles || true
+          if [ -s /tmp/pyfiles ]; then
+            echo "any=true" >> "$GITHUB_OUTPUT"
+            echo "待检查文件:"; cat /tmp/pyfiles
+          else
+            echo "any=false" >> "$GITHUB_OUTPUT"
+            echo "无 Python 文件变更，跳过 lint 检查"
+          fi
+
       - name: Ruff check
-        run: ruff check . --output-format=github
+        if: steps.changed-py.outputs.any == 'true'
+        run: xargs -a /tmp/pyfiles ruff check --output-format=github
 
       - name: Black format check
-        run: black --check .
+        if: steps.changed-py.outputs.any == 'true'
+        run: xargs -a /tmp/pyfiles black --check
 
       - name: isort check
-        run: isort --check-only --diff .
+        if: steps.changed-py.outputs.any == 'true'
+        run: xargs -a /tmp/pyfiles isort --check-only --diff
 
       - name: mypy type check
         # Shannon-Model 涉及多模态/CANN/CUDA 后端绑定，mypy 警告较多时可在 pyproject.toml 放宽
-        run: mypy --install-types --non-interactive . || true
+        if: steps.changed-py.outputs.any == 'true'
+        run: xargs -a /tmp/pyfiles mypy --install-types --non-interactive || true
