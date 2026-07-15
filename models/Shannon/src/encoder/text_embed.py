@@ -139,7 +139,10 @@ class TextEmbedding(nn.Module):
             pos = pos[position_ids]  # [B, S, H]
         if self.use_pos_proj:
             pos = self.pos_proj(pos)
-        h = tok + pos.unsqueeze(0) if position_ids is not None else tok + pos
+        # position_ids 为 None 时 pos 是 [S, H], 与 [B, S, H] 广播相加;
+        # position_ids 不为 None 时 pos 已是 [B, S, H], 直接相加.
+        # 旧代码 pos.unsqueeze(0) 会产生 [1, B, S, H] 导致 4D 错误, 已修复.
+        h = tok + pos
 
         h = self.norm(h)
         h = self.dropout(h)

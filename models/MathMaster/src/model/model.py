@@ -59,6 +59,22 @@ from common.nsl import (
 
 from ..config.config import MathConfig
 
+# === 从 common_base 导入共享组件 (与 Shannon 共用底子) ==================
+# ExpertFFN / EmptyExpert / ResidualPool / ExpertPool / ABStack 等共享组件
+# 已提取到 models.common_base, MathMaster 与 Shannon 共用同一底子架构.
+from models.common_base import (
+    BaseConfig,
+    ExpertFFN,
+    EmptyExpert,
+    ResidualPool,
+    ExpertPool,
+    MetaRouter,
+    SubAgent,
+    FivePathAttention,
+    ABBlock,
+    ABStack,
+)
+
 
 # =====================================================================
 # 辅助函数
@@ -78,63 +94,6 @@ def _build_attention_config(cfg: MathConfig, layer_idx: int = 0) -> AttentionCon
         layer_idx=layer_idx,
         rms_eps=cfg.rms_eps,
     )
-
-
-def _sinkhorn_normalize(log_matrix: torch.Tensor, num_iters: int = 10) -> torch.Tensor:
-    """对 [..., n, m] 的 log 概率矩阵做 Sinkhorn 归一化, 返回双随机矩阵.
-
-    使用 log 空间计算以保证数值稳定性.
-    """
-    z = log_matrix
-    for _ in range(num_iters):
-        z = z - torch.logsumexp(z, dim=-1, keepdim=True)   # 行归一化
-        z = z - torch.logsumexp(z, dim=-2, keepdim=True)   # 列归一化
-    return z.exp()
-
-
-def _hungarian_hard_perm(soft_perm: torch.Tensor) -> torch.Tensor:
-    """从软置换矩阵 [..., n, n] 提取硬置换 (贪心近似匈牙利匹配).
-
-    返回 one-hot 置换矩阵, 保持可微性 (straight-through: 前向用硬, 反向用软).
-    """
-    n = soft_perm.shape[-1]
-    with torch.no_grad():
-        hard = torch.zeros_like(soft_perm)
-        cost = soft_perm.clone()
-        for _ in range(n):
-            idx = cost.argmax(dim=-1)             # [..., n] 每行最大列
-            row = torch.arange(n, device=soft_perm.device)
-            # 展平以便用 scatter
-            flat_idx = idx + row * n
-            flat_cost = cost.view(*cost.shape[:-2], n * n)
-            hard_flat = hard.view(*hard.shape[:-2], n * n)
-            hard_flat.scatter_(-1, flat_idx.unsqueeze(-1), 1.0)
-            # 置零已选列, 防止重复
-            mask = torch.zeros_like(cost)
-            mask.scatter_(-1, idx.unsqueeze(-1).unsqueeze(-2).expand_as(cost), 1.0)
-            cost = cost.masked_fill(mask.bool(), float("-inf"))
-    # straight-through 估计器
-    return hard + soft_perm - soft_perm.detach()
-
-
-# =====================================================================
-# ExpertFFN (专家前馈网络, 带 down-projection)
-# =====================================================================
-
-class ExpertFFN(nn.Module):
-    """专家 FFN: SwiGLU 扩展 + 线性降维回 hidden_dim.
-
-    SwiGLU(in, inter) 产生 inter 维输出, 再经 down_proj 降回 in 维.
-    这是标准 LLaMA 风格 FFN: w_down(silu(w_gate(x)) * w_up(x)).
-    """
-
-    def __init__(self, d_model: int, inter_dim: int, bias: bool = False):
-        super().__init__()
-        self.glu = SwiGLU(d_model, inter_dim, bias=bias)
-        self.down = nn.Linear(inter_dim, d_model, bias=bias)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down(self.glu(x))
 
 
 # =====================================================================
@@ -239,109 +198,6 @@ class MathEncoder(nn.Module):
 
 
 # =====================================================================
-# ResidualPool (残差池)
-# =====================================================================
-
-class ResidualPool(nn.Module):
-    """残差池: AttnRes+mHC约束 + attention检索"有用笔记" + 删除非AB残差+压缩 + 每3轮top-k.
-
-    每轮迭代:
-      1. 将当前 hidden 与池中残差 (仅AB残差) 堆叠
-      2. AttnRes 注意力聚合 + mHC 流形约束聚合
-      3. attention 检索: 用 hidden 查询池中残差, 取最相关的"有用笔记"
-      4. 删除非AB残差 + 压缩 (线性投影降维)
-      5. 每 pool_compress_every 轮: 注意力索引 + top-k 筛选
-    """
-
-    def __init__(self, cfg: MathConfig):
-        super().__init__()
-        self.cfg = cfg
-        d = cfg.hidden_dim
-
-        # AttnRes + mHC (从 common.layers 导入复用)
-        self.attn_res = AttnRes(d, num_blocks=cfg.attn_res_num_blocks, eps=cfg.rms_eps) \
-            if cfg.use_attn_res else None
-        self.mhc = mHC(d, num_iters=cfg.mhc_num_iters) \
-            if cfg.use_mhc else None
-
-        # attention 检索 "有用笔记" (简易分类器: hidden × pool → 相关性分数)
-        self.note_query = nn.Linear(d, d, bias=False)
-        self.note_key = nn.Linear(d, d, bias=False)
-        self.note_scale = d ** -0.5
-
-        # 压缩投影 (删除非AB残差后压缩)
-        self.compress_proj = nn.Linear(d, d, bias=False)
-        self.compress_norm = RMSNorm(d, eps=cfg.rms_eps)
-
-        # top-k 筛选的可学习门控
-        self.topk_gate = nn.Linear(d, 1, bias=False)
-
-        self.topk = cfg.pool_topk
-        self.compress_every = cfg.pool_compress_every
-
-    def forward(
-        self,
-        hidden: torch.Tensor,
-        ab_residuals: List[torch.Tensor],
-        iteration: int,
-    ) -> Tuple[torch.Tensor, List[torch.Tensor], torch.Tensor]:
-        """处理残差池.
-
-        Args:
-            hidden: [b, s, d] 当前隐藏状态.
-            ab_residuals: 池中 AB 残差列表 (每项 [b, s, d]); 非AB残差已被删除.
-            iteration: 当前迭代索引.
-        Returns:
-            (pooled_hidden, new_ab_residuals, aux_loss)
-        """
-        b, s, d = hidden.shape
-        aux_loss = hidden.new_zeros(())
-
-        # --- 1. AttnRes + mHC 聚合残差 ---
-        if len(ab_residuals) > 0 and self.attn_res is not None:
-            stacked = torch.stack(ab_residuals, dim=-2)          # [b, s, L, d]
-            attn_agg = self.attn_res(stacked)                     # [b, s, d]
-            hidden = hidden + attn_agg
-        if len(ab_residuals) > 0 and self.mhc is not None:
-            stacked = torch.stack(ab_residuals, dim=-2)          # [b, s, L, d]
-            mhc_agg = self.mhc(stacked)                           # [b, s, L, d]
-            # 取最后一层 (最近残差) 融合
-            hidden = hidden + mhc_agg[..., -1, :]
-
-        # --- 2. attention 检索 "有用笔记" ---
-        if len(ab_residuals) > 0:
-            q = self.note_query(hidden)                           # [b, s, d]
-            keys = torch.stack([self.note_key(r) for r in ab_residuals], dim=-2)  # [b, s, L, d]
-            scores = torch.einsum("bsd,bsld->bsl", q, keys) * self.note_scale  # [b, s, L]
-            attn_weights = F.softmax(scores, dim=-1)              # [b, s, L]
-            retrieved = torch.einsum("bsl,bsld->bsd", attn_weights, torch.stack(ab_residuals, dim=-2))
-            hidden = hidden + retrieved
-
-        # --- 3. 压缩 (投影 + 归一化) ---
-        compressed = self.compress_norm(self.compress_proj(hidden))
-
-        # --- 4. 每 compress_every 轮: top-k 筛选 ---
-        if (iteration + 1) % self.compress_every == 0 and len(ab_residuals) > self.topk:
-            # 按 topk_gate 分数筛选最有用的残差
-            gate_scores = torch.stack(
-                [self.topk_gate(r).squeeze(-1).mean(dim=-1) for r in ab_residuals],
-                dim=-1,
-            )                                                      # [b, L]
-            k = min(self.topk, len(ab_residuals))
-            _, top_idx = gate_scores.topk(k, dim=-1)              # [b, k]
-            # 收集每个 batch 的 top-k 残差 (批处理: 用 gather)
-            new_residuals: List[torch.Tensor] = []
-            stacked_res = torch.stack(ab_residuals, dim=1)        # [b, L, s, d]
-            for ki in range(k):
-                idx_ki = top_idx[:, ki]                            # [b]
-                gathered = stacked_res[torch.arange(b), idx_ki]   # [b, s, d]
-                new_residuals.append(gathered)
-            ab_residuals = new_residuals
-
-        return hidden, ab_residuals, aux_loss
-
-
-# =====================================================================
 # IntuitionLayer (直觉层, 基础版)
 # =====================================================================
 
@@ -400,201 +256,13 @@ class IntuitionLayer(nn.Module):
 
 
 # =====================================================================
-# ExpertPool (共享专家池)
+# MetaRouter / SubAgent / FivePathAttention / ABBlock / ABStack
+# --- 以上组件已提取到 models.common_base, 与 Shannon 共用底子架构 ---
 # =====================================================================
-
-class EmptyExpert(nn.Module):
-    """空专家 (参考 Shannon EmptyExpert 设计): 零初始化门控, 逐步填充.
-
-    专家本体为 ExpertFFN (SwiGLU + down-proj), 但 down 投影零初始化且输出乘以
-    零初始化标量门控, 使得初始贡献为 0, 在持续学习阶段逐步吸收新能力.
-    """
-
-    def __init__(self, d_model: int, inter_dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.glu = SwiGLU(d_model, inter_dim)
-        self.down = nn.Linear(inter_dim, d_model, bias=False)
-        nn.init.zeros_(self.down.weight)  # 零初始化 down 投影
-        self.gate = nn.Parameter(torch.zeros(1))  # 零初始化门控
-        self.norm = RMSNorm(d_model, eps=eps)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.norm(self.gate * self.down(self.glu(x)))
-
-
-class ExpertPool(nn.Module):
-    """共享专家池: 6常驻 (4固定+2可学习) + 16大×16小双层MoE.
-
-    组件:
-      * 4 固定常驻专家 (SwiGLU, 密集, 不受路由, 始终开启)
-      * 2 可学习常驻专家 (EmptyExpert 零初始化, NLM增强, 密集)
-      * 16 大专家 (SwiGLU 粗粒度, top-k 路由, 稀疏)
-      * 16 小专家 (SwiGLU 细粒度, top-k 路由, 稀疏)
-      * CTMRouter (复杂度驱动, 控制 NLM 增强开关)
-      * NLMLayer (神经元级模型, 增强 2 可学习专家的激活)
-    """
-
-    def __init__(self, cfg: MathConfig):
-        super().__init__()
-        self.cfg = cfg
-        d = cfg.hidden_dim
-        big_inter = cfg.moe_inter_dim
-        small_inter = max(d, int(big_inter * cfg.small_expert_inter_ratio))
-
-        # --- 常驻专家: 4 固定 + 2 可学习 ---
-        self.fixed_experts = nn.ModuleList([
-            ExpertFFN(d, big_inter) for _ in range(cfg.num_fixed_resident_experts)
-        ])
-        self.learnable_experts = nn.ModuleList([
-            EmptyExpert(d, big_inter, eps=cfg.rms_eps)
-            for _ in range(cfg.num_learnable_resident_experts)
-        ])
-        # NLM 增强 (从 common.ctm 导入复用)
-        self.nlm_layers = nn.ModuleList([
-            NLMLayer(d, num_neurons=cfg.ctm_num_neurons, d_state=cfg.ctm_d_state,
-                     warmup_freeze=cfg.ctm_warmup_freeze)
-            for _ in range(cfg.num_learnable_resident_experts)
-        ])
-        self.resident_norm = RMSNorm(d, eps=cfg.rms_eps)
-
-        # --- 双层 MoE: 16 大 + 16 小 ---
-        self.big_experts = nn.ModuleList([
-            ExpertFFN(d, big_inter) for _ in range(cfg.num_big_experts)
-        ])
-        self.small_experts = nn.ModuleList([
-            ExpertFFN(d, small_inter) for _ in range(cfg.num_small_experts)
-        ])
-        self.big_router = nn.Linear(d, cfg.num_big_experts, bias=False)
-        self.small_router = nn.Linear(d, cfg.num_small_experts, bias=False)
-        self.moe_norm = RMSNorm(d, eps=cfg.rms_eps)
-
-        # CTMRouter (从 common.ctm 导入复用): 复杂度驱动 NLM 增强
-        self.ctm_router = CTMRouter(
-            d_model=d,
-            num_nlm=cfg.num_learnable_resident_experts,
-            num_standard=cfg.num_big_experts,
-            num_shared=cfg.num_fixed_resident_experts,
-            top_k=min(cfg.top_k_big, 4),
-            complexity_threshold=cfg.ctm_complexity_threshold,
-            router_dropout=cfg.attention_dropout,
-            noise_std=cfg.router_noise_std,
-        )
-
-        self.top_k_big = cfg.top_k_big
-        self.top_k_small = cfg.top_k_small
-        self.num_big = cfg.num_big_experts
-        self.num_small = cfg.num_small_experts
-        self.router_noise_std = cfg.router_noise_std
-
-    def _route_topk(
-        self,
-        x_flat: torch.Tensor,
-        router: nn.Linear,
-        num_experts: int,
-        top_k: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Top-k 路由: 返回 (output, aux_loss, scores)."""
-        logits = router(x_flat)                                    # [N, E]
-        if self.training and self.router_noise_std > 0:
-            logits = logits + torch.randn_like(logits) * self.router_noise_std
-        scores = F.softmax(logits, dim=-1)                         # [N, E]
-        k = min(top_k, num_experts)
-        topk_scores, topk_idx = scores.topk(k, dim=-1)            # [N, k]
-        topk_scores = topk_scores / (topk_scores.sum(dim=-1, keepdim=True) + 1e-9)
-        return topk_idx, topk_scores, scores
-
-    def _gather_moe(
-        self,
-        x_flat: torch.Tensor,
-        experts: nn.ModuleList,
-        topk_idx: torch.Tensor,
-        topk_scores: torch.Tensor,
-    ) -> torch.Tensor:
-        """聚集 top-k 专家输出."""
-        N, k = topk_idx.shape
-        d = x_flat.shape[-1]
-        out = torch.zeros_like(x_flat)
-        for ki in range(k):
-            idx_ki = topk_idx[:, ki]                              # [N]
-            w_ki = topk_scores[:, ki]                             # [N]
-            # 按专家分组处理
-            for ei in range(len(experts)):
-                mask = idx_ki == ei
-                if not mask.any():
-                    continue
-                x_sel = x_flat[mask]                              # [M, d]
-                out_sel = experts[ei](x_sel)                      # [M, d]
-                out[mask] += w_ki[mask].unsqueeze(-1) * out_sel
-        return out
-
-    def _load_balance_loss(self, scores: torch.Tensor, topk_idx: torch.Tensor, num_experts: int) -> torch.Tensor:
-        """标准 MoE 负载均衡损失."""
-        N = scores.shape[0]
-        # 每个专家收到的 token 比例
-        flat_idx = topk_idx.reshape(-1)
-        tokens_per_expert = torch.bincount(flat_idx, minlength=num_experts).float()
-        frac_tokens = tokens_per_expert / max(N, 1)
-        # 每个专家的平均路由概率
-        mean_prob = scores.mean(dim=0)
-        return num_experts * (frac_tokens * mean_prob).sum()
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        top_k_big_override: Optional[int] = None,
-        top_k_small_override: Optional[int] = None,
-        use_nlm: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """专家池前向.
-
-        Args:
-            x: [b, s, d] 输入.
-            top_k_big_override / top_k_small_override: 子agent 可覆盖 top-k (不同路由策略).
-            use_nlm: 是否启用 NLM 增强 (G5 子agent).
-        Returns:
-            (output [b, s, d], aux_loss scalar)
-        """
-        b, s, d = x.shape
-        aux = x.new_zeros(())
-
-        # --- 常驻专家 (密集, 始终开启) ---
-        resident = x.new_zeros(b, s, d)
-        for exp in self.fixed_experts:
-            resident = resident + exp(x)
-        # 可学习专家 (EmptyExpert, 零门控逐步填充) + 可选 NLM 增强
-        for i, (exp, nlm) in enumerate(zip(self.learnable_experts, self.nlm_layers)):
-            exp_out = exp(x)
-            if use_nlm:
-                # NLM 增强: 对 flatten 的 token 跑一个 tick
-                x_flat = x.reshape(b * s, d)
-                nlm_out, _ = nlm(x_flat)
-                nlm_out = nlm_out.reshape(b, s, d)
-                exp_out = exp_out + nlm_out
-            resident = resident + exp_out
-        resident = resident / max(self.cfg.num_resident_experts, 1)
-
-        # --- 双层 MoE (稀疏, top-k 路由) ---
-        x_flat = x.reshape(b * s, d)
-        k_big = top_k_big_override or self.top_k_big
-        k_small = top_k_small_override or self.top_k_small
-
-        big_idx, big_w, big_scores = self._route_topk(
-            x_flat, self.big_router, self.num_big, k_big)
-        big_out = self._gather_moe(x_flat, self.big_experts, big_idx, big_w)
-        aux = aux + self._load_balance_loss(big_scores, big_idx, self.num_big)
-
-        small_idx, small_w, small_scores = self._route_topk(
-            x_flat, self.small_router, self.num_small, k_small)
-        small_out = self._gather_moe(x_flat, self.small_experts, small_idx, small_w)
-        aux = aux + self._load_balance_loss(small_scores, small_idx, self.num_small)
-
-        moe_out = (big_out + small_out).reshape(b, s, d)
-        out = self.resident_norm(resident) + self.moe_norm(moe_out)
-        return out, aux
 
 
 # =====================================================================
-# MetaRouter (元路由器, 1对1置换)
+# LoopControl (循环控制)
 # =====================================================================
 
 class MetaRouter(nn.Module):

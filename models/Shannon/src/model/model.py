@@ -1,17 +1,22 @@
 """Shannon 模型 (ShannonModel) — 编码器(3%) + 循环主体(94%) + 解码器(3%).
 
-Shannon 15B MoE 模型顶层架构:
+Shannon 150B MoE 模型顶层架构:
     input_ids ──→ ShannonEncoder (3%) ──→ ShannonRecurrentBody (94%) ──→ ShannonDecoder (3%) ──→ logits
 
   - ShannonEncoder: 文本嵌入 + 模态嵌入 + 轻量编码层 (3% 参数)
-  - ShannonRecurrentBody: RDT 循环主体, 1-32 次动态迭代 (94% 参数)
+  - ShannonRecurrentBody: RDT 循环主体, 1-32 次动态迭代 + 6 常驻专家 (94% 参数)
   - ShannonDecoder: B+C 融合解码器 + 多任务输出头 (3% 参数)
+
+常驻专家 (与 MathMaster 共用 common_base 底子):
+  - 4 固定常驻专家 (ExpertFFN, 始终开启, 不受路由)
+  - 2 可学习常驻专家 (EmptyExpert 零初始化, 逐步填充)
+  - 与循环主体内双层 MoE 并行计算, 结果相加
 
 权重共享:
   - 循环块权重在 1-32 次迭代间共享 (RecurrentBody 内部)
   - lm_head 与文本 token embedding 权重共享 (weight tying)
 
-参考: AGENTS.md 项目结构全景, spec §2 三层架构.
+参考: AGENTS.md 项目结构全景, spec §2 三层架构, common_base 底子架构.
 """
 
 from __future__ import annotations
@@ -23,6 +28,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from common.layers import RMSNorm
+
+from models.common_base import BaseConfig, ResidentExpertPool
 
 from ..config.config import ShannonConfig
 from ..encoder import (
@@ -144,6 +151,13 @@ class ShannonRecurrentBody(nn.Module):
     """Shannon 循环主体包装 (94% 参数).
 
     直接复用 recurrent.body.RecurrentBody, 提供与编码器/解码器对齐的接口.
+    额外添加 6 常驻专家 (4 固定 + 2 可学习), 与循环主体内双层 MoE 并行计算,
+    结果相加 (参考 MathMaster 多 MoE 结构, 共用 common_base 底子).
+
+    常驻专家:
+      * 4 固定常驻专家 (ExpertFFN, 始终开启, 不受路由)
+      * 2 可学习常驻专家 (EmptyExpert 零初始化, 逐步填充, 可选 NLM 增强)
+      * 常驻专家处理循环主体输出, 与双层 MoE 输出相加 (并行残差)
 
     Args:
         config: ShannonConfig.
@@ -153,6 +167,12 @@ class ShannonRecurrentBody(nn.Module):
         super().__init__()
         self.config = config
         self.body = RecurrentBody(config)
+
+        # 6 常驻专家 (4 固定 + 2 可学习), 从 common_base 导入, 与 MathMaster 共用底子
+        base_cfg = BaseConfig.from_shannon(config)
+        self.resident_experts = ResidentExpertPool(base_cfg)
+        # 残差缩放 (可学习, 初始化为小值, 避免常驻专家主导)
+        self.resident_scale = nn.Parameter(torch.ones(1) * 0.1)
 
     def forward(
         self,
@@ -172,12 +192,21 @@ class ShannonRecurrentBody(nn.Module):
         Returns:
             dict 含 hidden, aux_loss, n_iters 等.
         """
-        return self.body(
+        body_out = self.body(
             x,
             position_ids=position_ids,
             attention_mask=attention_mask,
             num_iters=num_iters,
         )
+        hidden = body_out["hidden"]  # [B, S, H]
+
+        # 常驻专家与双层 MoE 并行计算, 结果相加 (并行残差)
+        # use_nlm: 训练时启用 NLM 增强 (CTM 决策 C10: 仅实体专家使用 NLM)
+        resident_out = self.resident_experts(
+            hidden, use_nlm=self.config.ctm_enabled and self.training
+        )
+        body_out["hidden"] = hidden + self.resident_scale * resident_out
+        return body_out
 
 
 # ---------------------------------------------------------------------------
@@ -247,9 +276,10 @@ class ShannonDecoderWrapper(nn.Module):
 # 顶层模型
 # ---------------------------------------------------------------------------
 class ShannonModel(nn.Module):
-    """Shannon 15B MoE 顶层模型.
+    """Shannon 150B MoE 顶层模型.
 
     架构: 编码器(3%) + 循环主体(94%) + 解码器(3%).
+    循环主体含 6 常驻专家 (4 固定 + 2 可学习), 与 MathMaster 共用 common_base 底子.
 
     Args:
         config: ShannonConfig. 若 None 用默认配置.
@@ -357,8 +387,12 @@ class ShannonModel(nn.Module):
         input_ids: torch.Tensor,
         max_new_tokens: int = 128,
         num_iters: Optional[int] = None,
-    ) -> Dict[str, torch.Tensor]:
+    ) -> torch.Tensor:
         """推理生成.
+
+        维护 current_pos 追踪已生成位置数, 每步位置编码从 0..current_pos-1
+        完整计算 (循环主体权重共享+动态深度, 不支持 KV cache, 故用完整序列
+        重新前向, 但位置编码必须连续且正确).
 
         Args:
             input_ids: [B, S] prompt token id.
@@ -366,24 +400,40 @@ class ShannonModel(nn.Module):
             num_iters: 循环迭代次数.
 
         Returns:
-            dict 含 tokens (生成 token 序列).
+            tokens: [B, S + max_new_tokens] 生成 token 序列 (含 prompt).
         """
-        def token_embed_fn(ids):
-            pos = torch.arange(ids.shape[1], device=ids.device)
-            return self.encoder.text_embed(ids, position_ids=pos.unsqueeze(0).expand_as(ids))
+        B = input_ids.shape[0]
+        device = input_ids.device
+        ids = input_ids.clone()
+        # current_pos 记录已编码的位置数 (prompt 长度)
+        current_pos = input_ids.shape[1]
 
-        # 编码 + 循环
-        enc_out = self.encoder(input_ids, modality_id=MODALITY_TEXT)
-        body_out = self.recurrent_body(enc_out, num_iters=num_iters)
-        hidden = body_out["hidden"]
+        for _ in range(max_new_tokens):
+            # 位置编码: 0 .. current_pos-1 (完整序列, 连续且正确)
+            pos = torch.arange(current_pos, device=device).unsqueeze(0).expand(B, -1)
 
-        # 解码生成
-        gen = self.decoder.main.generate(
-            hidden,
-            token_embed_fn=token_embed_fn,
-            max_new_tokens=max_new_tokens,
-        )
-        return gen
+            # 完整模型前向 (无 KV cache, 重新计算完整序列)
+            enc_out = self.encoder(
+                ids,
+                position_ids=pos,
+                modality_id=MODALITY_TEXT,
+            )
+            body_out = self.recurrent_body(
+                enc_out,
+                position_ids=pos,
+                num_iters=num_iters,
+            )
+            hidden = body_out["hidden"]  # [B, current_pos, H]
+
+            # 取最后 token 的 hidden, 解码为下一 token
+            h_last = self.decoder.main.norm(hidden[:, -1, :])  # [B, H]
+            logits = self.decoder.main.lm_head(h_last)  # [B, vocab]
+            next_token = logits.argmax(dim=-1, keepdim=True)  # [B, 1]
+
+            ids = torch.cat([ids, next_token], dim=1)
+            current_pos += 1
+
+        return ids
 
     # ------------------------------------------------------------------
     def num_parameters(self, only_trainable: bool = False) -> int:

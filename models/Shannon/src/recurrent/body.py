@@ -95,9 +95,19 @@ class HybridM3AttentionLayer(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         past_kv: Any = None,
         use_cache: bool = False,
+        iteration_step: int = 0,
     ) -> torch.Tensor:
-        """前向: 根据 phase 路由注意力计算."""
-        if self.phase in (0, 2):
+        """前向: 根据 phase 路由注意力计算.
+
+        Args:
+            iteration_step: 循环迭代步 (用于动态计算 phase,
+                使权重共享时 4 层周期注意力真正轮转).
+        """
+        # 动态 phase: (layer_idx + iteration_step) % 4
+        # 解决 layer_idx 硬编码为 0 导致永远只走 KDA 的问题.
+        phase = (self.config.layer_idx + int(iteration_step)) % 4
+
+        if phase in (0, 2):
             out = self.kda(
                 hidden_states,
                 position_ids=position_ids,
@@ -107,7 +117,7 @@ class HybridM3AttentionLayer(nn.Module):
             )
             return self.norm(out.output)
 
-        if self.phase == 1:
+        if phase == 1:
             out_kda = self.kda(
                 hidden_states,
                 position_ids=position_ids,
@@ -259,7 +269,9 @@ class RecurrentBlock(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         nlm_states: Optional[Dict[int, list]] = None,
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[int, list]]:
+        iteration_step: int = 0,
+        attn_history: Optional[List[torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[int, list], List[torch.Tensor]]:
         """单次循环迭代前向.
 
         Args:
@@ -268,14 +280,19 @@ class RecurrentBlock(nn.Module):
             position_ids: [B, S].
             attention_mask: [B, S] 或 [B, 1, S, S].
             nlm_states: 上一 tick 的 NLM 状态.
+            iteration_step: 循环迭代步 (用于 Hybrid-M3 phase 轮转).
+            attn_history: 前序迭代的注意力输出列表 (用于 AttnRes 聚合).
 
         Returns:
             out: [B, S, H].
             aux: 辅助信息 (aux_loss 等).
             new_nlm_states: 更新后的 NLM 状态.
+            new_attn_history: 更新后的注意力输出历史 (含本轮).
         """
         B, S, H = x.shape
         aux: Dict[str, torch.Tensor] = {}
+        if attn_history is None:
+            attn_history = []
 
         # 1. 深度位置嵌入
         d_emb = self.depth_embed(depth, B, S)
@@ -284,15 +301,32 @@ class RecurrentBlock(nn.Module):
         # 2. 深度 LoRA 适配 (对注意力输入做适配)
         h = self.depth_lora.apply("adapter_0", h, depth)
 
-        # 3. 注意力 (pre-norm + residual)
+        # 3. 注意力 (pre-norm + residual, 传入 iteration_step 让 phase 轮转)
         attn_in = self.attn_norm(h)
         attn_out = self._attn_ckpt(
             attn_in,
             position_ids=position_ids,
             attention_mask=attention_mask,
             use_cache=False,
+            iteration_step=iteration_step,
         )
-        h = h + attn_out
+
+        # 3b. AttnRes 块级残差聚合 (Bug 3 修复):
+        #     将当前注意力输出与前序迭代输出通过 AttnRes 加权聚合,
+        #     替代简单残差 h = h + attn_out.
+        if self.use_attn_res and self.attn_res is not None and len(attn_history) > 0:
+            all_attn = list(attn_history) + [attn_out]
+            # block_ids: 将各迭代步分配到 num_blocks 个块
+            L_attn = len(all_attn)
+            block_ids = torch.arange(
+                L_attn, device=attn_out.device
+            ) % max(self.attn_res.num_blocks, 1)
+            aggregated = self.attn_res(all_attn, block_ids=block_ids)
+            h = h + aggregated
+        else:
+            h = h + attn_out
+
+        new_attn_history = attn_history + [attn_out]
 
         # 4. 双层 MoE (pre-norm + residual)
         moe_in = self.moe_norm(h)
@@ -306,7 +340,7 @@ class RecurrentBlock(nn.Module):
             delta = h - x
             h = self.residual_stabilizer(x, delta)
 
-        return h, aux, moe_result.get("new_nlm_states", {})
+        return h, aux, moe_result.get("new_nlm_states", {}), new_attn_history
 
 
 class RecurrentBody(nn.Module):
@@ -348,8 +382,9 @@ class RecurrentBody(nn.Module):
         # CTM: MLA 同步矩阵 + 动态损失
         self.ctm_enabled = config.ctm_enabled
         if self.ctm_enabled:
+            d_c = max(config.hidden_dim // 4, 8)
             self.mla_sync = MLASync(
-                d_c=max(config.hidden_dim // 4, 8),
+                d_c=d_c,
                 num_neurons=config.nlm_num_neurons,
             )
             self.ctm_loss = CTMDynamicLoss(
@@ -357,9 +392,21 @@ class RecurrentBody(nn.Module):
                 lambda_tick=config.ctm.ctm_lambda_tick,
                 lambda_monotone=config.ctm.ctm_lambda_monotone,
             )
+            # CTM MLA 同步投影层 (Bug 2 修复):
+            #   ctm_proj: H -> d_c (投影到 MLA 压缩维度)
+            #   ctm_back_proj: d_c -> H (同步结果投影回 hidden_dim, 残差连接)
+            #   ctm_logits_proj: H -> d_c (每 tick 的 "logits", 用于 CTM 动态损失)
+            self.ctm_d_c = d_c
+            self.ctm_proj = nn.Linear(config.hidden_dim, d_c, bias=False)
+            self.ctm_back_proj = nn.Linear(d_c, config.hidden_dim, bias=False)
+            self.ctm_logits_proj = nn.Linear(config.hidden_dim, d_c, bias=False)
         else:
             self.mla_sync = None
             self.ctm_loss = None
+            self.ctm_d_c = 0
+            self.ctm_proj = None
+            self.ctm_back_proj = None
+            self.ctm_logits_proj = None
 
         # 输出归一化
         self.norm = RMSNorm(config.hidden_dim, eps=config.rms_eps)
@@ -415,11 +462,18 @@ class RecurrentBody(nn.Module):
         # CTM NLM 状态 (跨迭代传递)
         nlm_states: Optional[Dict[int, list]] = None
 
+        # AttnRes 注意力输出历史 (跨迭代传递, 用于块级残差聚合)
+        attn_history: List[torch.Tensor] = []
+
+        # CTM 每 tick 的 logits (用于动态损失, Bug 2 修复)
+        ctm_tick_logits: List[torch.Tensor] = []
+
         h = x
         all_layers: List[torch.Tensor] = []
         total_aux = torch.zeros((), device=device, dtype=dtype)
         total_ponder = torch.zeros((), device=device, dtype=dtype)
 
+        it = 0
         for it in range(target_iters):
             # ACT 检查: 是否还有 active token
             if self.act_enabled and act_state is not None:
@@ -428,12 +482,16 @@ class RecurrentBody(nn.Module):
                     break
 
             # 循环块前向 (detach NLM states: 截断 BPTT, 防止跨迭代图爆炸)
-            h_new, block_aux, nlm_states = self.block(
+            # 传入 iteration_step 让 Hybrid-M3 phase 真正轮转 (Bug 1 修复)
+            # 传入 attn_history 让 AttnRes 做块级残差聚合 (Bug 3 修复)
+            h_new, block_aux, nlm_states, attn_history = self.block(
                 h,
                 depth=it,
                 position_ids=position_ids,
                 attention_mask=attention_mask,
                 nlm_states=_detach_nlm_states(nlm_states),
+                iteration_step=it,
+                attn_history=attn_history,
             )
             # ACT: 对 active token 更新, halted token 保持
             if self.act_enabled and act_state is not None:
@@ -451,16 +509,47 @@ class RecurrentBody(nn.Module):
             if moe_aux is not None:
                 total_aux = total_aux + moe_aux
 
-            # CTM MLA 同步 (每步同步)
+            # CTM MLA 同步 (每步同步, Bug 2 修复):
+            #   1. 把当前隐状态 h 投影到 MLA 压缩维度 d_c
+            #   2. 调用 mla_sync.sync_matrix 计算 c_kv·c_kv^T 同步矩阵 S
+            #   3. 用 S 聚合 c_kv 后投影回 hidden_dim, 残差加到 h 上
             if self.ctm_enabled and self.mla_sync is not None:
-                # 用当前隐状态做潜变量同步 (简化: 直接对 h 应用同步归一化)
-                # MLASync 期望 [B, S, d_c], 此处用投影近似
-                pass
+                c_kv = self.ctm_proj(h)  # [B, S, d_c]
+                S = self.mla_sync.sync_matrix(c_kv)  # [B, S, S]
+                synced_c = torch.matmul(S, c_kv)  # [B, S, d_c] (潜变量同步)
+                h_sync = self.ctm_back_proj(synced_c)  # [B, S, H]
+                h = h + h_sync  # 残差连接
 
-            if return_all_layers:
+                # 收集当前 tick 的 "logits" (取最后 token, 用于 CTM 动态损失)
+                tick_logits = self.ctm_logits_proj(h[:, -1, :])  # [B, d_c]
+                ctm_tick_logits.append(tick_logits)
+
+            # 收集各迭代步隐状态 (mHC 或 return_all_layers 需要)
+            if self.use_mhc or return_all_layers:
                 all_layers.append(h)
 
+            # mHC 深度方向归一化约束 (Bug 3 修复):
+            #   将所有迭代步的隐状态通过 Sinkhorn 双随机矩阵重新混合,
+            #   保证深度方向信号不爆炸 (谱范数 <= 1).
+            if self.use_mhc and hasattr(self.block, "mhc") and self.block.mhc is not None:
+                remixed = self.block.mhc(all_layers)  # [B, S, L, H]
+                h = remixed[..., -1, :]  # [B, S, H] 取最后一层作为当前隐状态
+                all_layers[-1] = h
+
         n_iters = it + 1
+
+        # CTM 动态损失 (Bug 2 修复): 基于各 tick 的 logits 计算动态损失
+        if (
+            self.ctm_enabled
+            and self.ctm_loss is not None
+            and len(ctm_tick_logits) >= 2
+        ):
+            logits_per_tick = torch.stack(ctm_tick_logits, dim=0)  # [T, B, d_c]
+            # 自监督标签: 最终 tick 的 argmax (鼓励各 tick 收敛到一致结果)
+            with torch.no_grad():
+                labels = logits_per_tick[-1].argmax(dim=-1)  # [B]
+            ctm_result = self.ctm_loss(logits_per_tick, labels)
+            total_aux = total_aux + ctm_result["loss"]
 
         # 最终归一化
         h = self.norm(h)

@@ -1,8 +1,11 @@
-"""ShannonConfig — Shannon 15B MoE 模型统一配置.
+"""ShannonConfig — Shannon 150B MoE 模型统一配置.
 
 定义编码器(3%)-循环主体(94%)-解码器(3%)三层架构的全部超参数,
-包括循环深度、双层MoE、Hybrid-M3注意力、NSL、CTM、位置编码、形式化验证、
-训练与评估配置.
+包括循环深度、双层MoE、6常驻专家(4固定+2可学习)、Hybrid-M3注意力、NSL、CTM、
+位置编码、形式化验证、训练与评估配置.
+
+目标规格: 150B 总参数 (MoE), 激活参数约 20-40B.
+Shannon 与 MathMaster 共用 common_base 底子架构 (6常驻+16x16双层MoE).
 
 参考: AGENTS.md 项目结构全景, spec.md §14 设计决策索引.
 """
@@ -51,15 +54,53 @@ class AttentionConfig:
 
 
 @dataclass
-class MoEConfig:
-    """双层MoE配置 (16大专家×16小专家, Top-4×Top-4, 空专家)."""
+class ResidentExpertConfig:
+    """常驻专家子配置 (6 常驻: 4 固定 + 2 可学习).
 
+    参考 MathMaster 多 MoE 结构与 Shannon EmptyExpert 零初始化设计.
+    常驻专家与双层 MoE 并行计算, 结果相加.
+    """
+
+    num_resident_experts: int = 6
+    num_fixed_resident_experts: int = 4
+    num_learnable_resident_experts: int = 2
+    # 固定常驻专家始终开启, 不受路由影响
+    fixed_always_active: bool = True
+    # 可学习常驻专家零初始化 (EmptyExpert 风格), 逐步填充
+    learnable_zero_init: bool = True
+    # 可学习专家可选 NLM 增强 (CTM 决策 C10: 仅实体专家使用 NLM)
+    learnable_nlm_enhanced: bool = True
+    # 常驻专家 FFN 维度 (0 -> 与 expert_ffn_dim 一致)
+    resident_ffn_dim: int = 0
+
+    def __post_init__(self):
+        if self.resident_ffn_dim <= 0:
+            self.resident_ffn_dim = 2048
+        assert (
+            self.num_fixed_resident_experts + self.num_learnable_resident_experts
+            == self.num_resident_experts
+        ), (
+            f"常驻专家数不匹配: 固定{self.num_fixed_resident_experts} + "
+            f"可学习{self.num_learnable_resident_experts} != "
+            f"总数{self.num_resident_experts}"
+        )
+
+
+@dataclass
+class MoEConfig:
+    """双层MoE配置 (16大专家×16小专家, Top-4×Top-4, 6常驻+空专家)."""
+
+    # 常驻专家 (6: 4 固定 + 2 可学习, 参考 MathMaster)
+    num_resident_experts: int = 6
+    num_fixed_resident_experts: int = 4
+    num_learnable_resident_experts: int = 2
+    # 双层 MoE
     num_big_experts: int = 16
     num_small_experts: int = 16
     top_k_big: int = 4
     top_k_small: int = 4
-    expert_ffn_dim: int = 1024
-    small_expert_ffn_dim: int = 512
+    expert_ffn_dim: int = 2048
+    small_expert_ffn_dim: int = 1024
     num_shared_experts: int = 2
     num_empty_experts: int = 4
     # 分层: 浅8/中16/深24
@@ -310,21 +351,22 @@ class EvaluationConfig:
 
 @dataclass
 class ShannonConfig:
-    """Shannon 15B MoE 模型统一配置.
+    """Shannon 150B MoE 模型统一配置.
 
     架构: 编码器(3%) + 循环主体(94%) + 解码器(3%)
-    参数: 15B总参数(MoE), 激活参数约2-4B
+    参数: 150B总参数(MoE), 激活参数约20-40B
     循环深度: 1-32次动态迭代
+    底子: 与 MathMaster 共用 common_base (6常驻+16x16双层MoE)
     """
 
-    # ---- 基础模型参数 ----
+    # ---- 基础模型参数 (150B 目标) ----
     vocab_size: int = 128000
-    hidden_dim: int = 4096
-    num_layers: int = 32
-    num_heads: int = 32
+    hidden_dim: int = 8192
+    num_layers: int = 48
+    num_heads: int = 64
     head_dim: int = 128
-    num_kv_heads: int = 8
-    max_seq_len: int = 32768
+    num_kv_heads: int = 16
+    max_seq_len: int = 524288  # 512K (从 5M 降低到更现实)
     rms_eps: float = 1e-6
     dropout: float = 0.0
     bias: bool = False
@@ -333,13 +375,18 @@ class ShannonConfig:
     dynamic_iterations: Tuple[int, int] = (1, 32)
     silent_thinking: bool = True
 
-    # ---- MoE ----
+    # ---- 常驻专家 (6: 4 固定 + 2 可学习, 参考 MathMaster) ----
+    num_resident_experts: int = 6
+    num_fixed_resident_experts: int = 4
+    num_learnable_resident_experts: int = 2
+
+    # ---- MoE (16大x16小, Top-4xTop-4) ----
     num_big_experts: int = 16
     num_small_experts: int = 16
     top_k_big: int = 4
     top_k_small: int = 4
-    expert_ffn_dim: int = 1024
-    small_expert_ffn_dim: int = 512
+    expert_ffn_dim: int = 2048
+    small_expert_ffn_dim: int = 1024
     num_shared_experts: int = 2
     num_empty_experts: int = 4
 
@@ -352,7 +399,7 @@ class ShannonConfig:
     # ---- 位置编码 ----
     rope_theta: float = 10000.0
     yarn_original_max: int = 8192
-    longrope_max_seq_len: int = 5_000_000
+    longrope_max_seq_len: int = 524288  # 512K
 
     # ---- NSL ----
     nsl_enabled: bool = True
@@ -405,6 +452,9 @@ class ShannonConfig:
     decoder_output: DecoderOutputConfig = field(default_factory=DecoderOutputConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
+    resident_expert_config: ResidentExpertConfig = field(
+        default_factory=ResidentExpertConfig
+    )
 
     # ------------------------------------------------------------------
     def __post_init__(self):
@@ -457,6 +507,9 @@ class ShannonConfig:
         attn.gated_rank = self.gated_rank
         # MoE
         moe = self.moe
+        moe.num_resident_experts = self.num_resident_experts
+        moe.num_fixed_resident_experts = self.num_fixed_resident_experts
+        moe.num_learnable_resident_experts = self.num_learnable_resident_experts
         moe.num_big_experts = self.num_big_experts
         moe.num_small_experts = self.num_small_experts
         moe.top_k_big = self.top_k_big
@@ -468,6 +521,14 @@ class ShannonConfig:
         moe.nlm_num_neurons = self.nlm_num_neurons
         moe.nlm_d_state = self.nlm_d_state
         moe.nlm_warmup_freeze = self.ctm_enabled
+        # 常驻专家子配置
+        rc = self.resident_expert_config
+        rc.num_resident_experts = self.num_resident_experts
+        rc.num_fixed_resident_experts = self.num_fixed_resident_experts
+        rc.num_learnable_resident_experts = self.num_learnable_resident_experts
+        rc.learnable_nlm_enhanced = self.ctm_enabled
+        if rc.resident_ffn_dim <= 0:
+            rc.resident_ffn_dim = self.expert_ffn_dim
         # 循环
         rec = self.recurrent
         rec.dynamic_iterations = self.dynamic_iterations
@@ -534,6 +595,7 @@ class ShannonConfig:
             "decoder_output": DecoderOutputConfig,
             "training": TrainingConfig,
             "evaluation": EvaluationConfig,
+            "resident_expert_config": ResidentExpertConfig,
         }
         for key, cls_sub in sub_configs.items():
             if key in d and isinstance(d[key], dict):
